@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice → Whisper API → Arduino</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --muted:#9ca3af; --text:#e5e7eb; --accent:#60a5fa; --ok:#22c55e; --err:#ef4444; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:linear-gradient(120deg,#0b1225,#0f172a); color:var(--text); font-family: system-ui,-apple-system,Segoe UI,Roboto,Inter,Ubuntu,"Noto Sans","IranYekan",sans-serif; }
+    .wrap { max-width: 980px; margin: 40px auto; padding: 0 16px; }
+    .card { background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:18px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); backdrop-filter: blur(6px); }
+    h1 { font-size: 22px; margin: 0 0 12px; display:flex; gap:8px; align-items:center; }
+    h1 .dot { width:10px; height:10px; border-radius:50%; background:var(--accent); display:inline-block; }
+    .row { display:flex; flex-wrap:wrap; gap:14px; margin: 10px 0 16px; }
+    .panel { flex:1 1 320px; border:1px dashed rgba(255,255,255,0.15); border-radius:14px; padding:16px; }
+    label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+    button { appearance:none; border:none; background:var(--accent); color:#001028; padding:10px 16px; border-radius:12px; font-weight:600; cursor:pointer; transition:.15s transform,.15s opacity; }
+    button:hover { transform: translateY(-1px); opacity:.95; }
+    button.secondary { background:transparent; color:var(--text); border:1px solid rgba(255,255,255,0.2); }
+    button.danger { background: var(--err); color: #fff; }
+    input[type="file"], select { width:100%; padding:10px; border-radius:10px; background:#0b1020; color:var(--text); border:1px solid rgba(255,255,255,0.15); }
+    .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .pill { padding:6px 10px; border-radius:10px; background:#0b1020; border:1px solid rgba(255,255,255,0.15); font-size:12px; color:var(--muted); }
+    .meter { font-variant-numeric: tabular-nums; }
+    .out { white-space: pre-wrap; background:#070b16; border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:12px; min-height:120px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px,1fr)); gap:14px; }
+    .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+    footer { margin-top: 16px; color: var(--muted); font-size: 12px; text-align:center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1><span class="dot"></span> Motor Control with Voice (Whisper API + LLM + Arduino)</h1>
+
+      <div class="grid">
+        <!-- Record from microphone -->
+        <div class="panel">
+          <label>Direct recording from microphone</label>
+          <div class="controls">
+            <button id="btnRec">Start Recording</button>
+            <button id="btnStop" class="secondary" disabled>Stop</button>
+            <span class="pill meter" id="timer">00:00</span>
+            <span class="pill" id="sizeInfo">0 KB</span>
+          </div>
+          <div class="hint">After stopping, the file will be uploaded to /voice-command.</div>
+          <div class="row" style="margin-top:12px">
+            <div>
+              <label>Forced language (optional)</label>
+              <select id="forceLang">
+                <option value="">Auto</option>
+                <option value="en">English (en)</option>
+                <option value="fa">Persian (fa)</option>
+              </select>
+            </div>
+            <div>
+              <label>Recorded file preview</label>
+              <audio id="preview" controls style="width:280px"></audio>
+            </div>
+          </div>
+        </div>
+
+        <!-- File upload -->
+        <div class="panel">
+          <label>Upload audio file</label>
+          <input type="file" id="fileInput" accept="audio/*" />
+          <div class="controls" style="margin-top:12px">
+            <button id="btnUpload">Send file</button>
+          </div>
+          <div class="hint">Common formats (mp3, wav, m4a, ogg, webm) are supported.</div>
+        </div>
+
+        <!-- Output -->
+        <div class="panel">
+          <label>Result</label>
+          <div id="output" class="out">{ Result will be displayed here }</div>
+          <div class="row">
+            <button class="secondary" id="btnStatus">Get STATUS from Arduino</button>
+            <button class="danger" id="btnOff">Send OFF</button>
+          </div>
+        </div>
+      </div>
+
+      <footer>Built for local testing — endpoint: <code>/voice-command</code> and <code>/status</code></footer>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const btnRec = document.getElementById('btnRec');
+  const btnStop = document.getElementById('btnStop');
+  const btnUpload = document.getElementById('btnUpload');
+  const btnStatus = document.getElementById('btnStatus');
+  const btnOff = document.getElementById('btnOff');
+  const fileInput = document.getElementById('fileInput');
+  const output = document.getElementById('output');
+  const timer = document.getElementById('timer');
+  const sizeInfo = document.getElementById('sizeInfo');
+  const preview = document.getElementById('preview');
+  const forceLang = document.getElementById('forceLang');
+
+  let mediaRecorder = null;
+  let chunks = [];
+  let t0 = 0;
+  let tick = null;
+
+  function log(obj) {
+    output.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+  }
+
+  function fmt(sec) {
+    sec = Math.max(0, sec|0);
+    const m = String((sec/60)|0).padStart(2,'0');
+    const s = String(sec%60).padStart(2,'0');
+    return `${m}:${s}`;
+  }
+
+  async function uploadBlob(blob, filename='recording.webm') {
+    const fd = new FormData();
+    fd.append('audio', blob, filename);
+    if (forceLang.value) fd.append('force_lang', forceLang.value);
+
+    log('Sending...');
+    const res = await fetch('/voice-command', { method:'POST', body: fd });
+    const json = await res.json().catch(() => ({}));
+    log(json);
+  }
+
+  btnRec.onclick = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
+      mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+      chunks = [];
+      mediaRecorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+        preview.src = URL.createObjectURL(blob);
+        sizeInfo.textContent = (blob.size/1024).toFixed(1) + ' KB';
+        await uploadBlob(blob, `mic.${mime.includes('webm')?'webm':'ogg'}`);
+      };
+      mediaRecorder.start();
+      t0 = Date.now();
+      tick = setInterval(() => {
+        const sec = (Date.now() - t0)/1000;
+        timer.textContent = fmt(sec);
+      }, 200);
+      btnRec.disabled = true;
+      btnStop.disabled = false;
+    } catch (err) {
+      log({ ok:false, err: String(err) });
+    }
+  };
+
+  btnStop.onclick = () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+      mediaRecorder.stream.getTracks().forEach(t => t.stop());
+    }
+    btnRec.disabled = false;
+    btnStop.disabled = true;
+    clearInterval(tick); tick = null;
+  };
+
+  btnUpload.onclick = async () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (!f) return log('No file selected.');
+    const fd = new FormData();
+    fd.append('audio', f, f.name);
+    if (forceLang.value) fd.append('force_lang', forceLang.value);
+    log('Sending file...');
+    const res = await fetch('/voice-command', { method:'POST', body: fd });
+    const json = await res.json().catch(() => ({}));
+    log(json);
+  };
+
+  btnStatus.onclick = async () => {
+    const res = await fetch('/status');
+    const json = await res.json().catch(() => ({}));
+    log(json);
+  };
+
+  btnOff.onclick = async () => {
+    const res = await fetch('/text-command', {
+      method:'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({ text: 'turn off' })
+    });
+    const json = await res.json().catch(() => ({}));
+    log(json);
+  };
+})();
+</script>
+</body>
+</html>
